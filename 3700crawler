@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+
+import re
+import argparse
+import os
+import time
+import threading
+import queue
+import socket
+import ssl
+import sys
+from html.parser import HTMLParser
+from urllib.parse import urljoin
+
+DEFAULT_SERVER = "www.3700.network"
+DEFAULT_PORT = 443
+LOGIN_PATH = "/accounts/login/?next=/fakebook/"
+ORIGIN_PATH = "/fakebook/"
+
+discovered_flags = []
+
+# class to parse html 
+class parseHTML(HTMLParser):
+    #Initializes the parseHTML instance with a reference to the crawler object.
+    def __init__(self, crawler):
+        super().__init__()
+        self.crawler = crawler
+        self.in_script = False
+
+    # Processes start tags of HTML elements
+    def handle_starttag(self, tag, attrs):
+        if tag != "a": return
+        href = next((value for name, value in attrs if name == 'href' and value.startswith("/fakebook/")), None)
+        if href:
+            full_link = f'https://{self.crawler.server}{href}'
+            if full_link not in self.crawler.visited_urls:
+                self.crawler.crawl_queue.put(full_link)
+
+        elif tag == "script":
+            self.in_script = True
+ 
+    def handle_endtag(self, tag):
+        if tag == "script":
+            self.in_script = False
+
+    # Handles and processes the data within HTML elements
+    def handle_data(self, data):
+        flag_prefix = 'FLAG: '
+        if flag_prefix in data:
+            flag = data[data.index(flag_prefix) + len(flag_prefix):].strip()
+            self._store_flag(flag)
+
+    def handle_comment(self, data):
+        if 'FLAG: ' in data:
+            self.handle_data(data)
+
+    # Stores a discovered flag in a file and updates the crawler's list of discovered flags, avoiding duplicates.
+    def _store_flag(self, flag):
+        with self.crawler.flag_lock:  # Acquire the flag lock
+            if self.is_flag_discovered(flag):
+                return
+            self.print_and_store_flag(flag)
+            self.update_discovered_flags(flag)
+
+            if len(self.crawler.secret_flags_discovered) >= 5:
+                self.crawler.stop_crawling.set()  # Signal all threads to stop
+
+
+    # Checks if the flag has already been discovered
+    def is_flag_discovered(self, flag):
+        return flag in self.crawler.secret_flags_discovered or flag in discovered_flags
+
+    # Prints the flag to stdout and appends it to the flag file.
+    def print_and_store_flag(self, flag):
+        print(flag)
+        flags_file_path = self.get_flags_file_path()
+        with open(flags_file_path, 'a') as file:
+            file.write(flag + '\n')
+        
+    # Updates the crawler's and global list of discovered flags.    
+    def update_discovered_flags(self, flag):
+        if flag not in self.crawler.secret_flags_discovered:
+            self.crawler.secret_flags_discovered.append(flag)
+        if flag not in discovered_flags:
+            discovered_flags.append(flag)
+
+    # Returns the file path for storing flags.
+    def get_flags_file_path(self):
+        return os.path.join(os.path.dirname(__file__), 'secret_flags')
+  
+class Crawler:
+    def __init__(self, args):
+        self.server = args.server
+        self.port = args.port
+        self.username = args.username
+        self.password = args.password
+        self.stop_crawling = threading.Event()
+        self.csrftoken = None 
+        self.sessionid = None  
+
+        self.crawl_queue = queue.Queue()
+        self.secret_flags_discovered = []
+        self.visited_urls = set()
+
+        self.url_lock = threading.Lock()  # Lock for visited URLs
+        self.flag_lock = threading.Lock()  # Lock for discovered flags
+
+    # Creates socket
+    def create_socket(self):
+        if not hasattr(self, 'socket'):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            ssl_sock = ssl.create_default_context().wrap_socket(sock, server_hostname=self.server)
+            ssl_sock.connect((self.server, self.port))
+        return ssl_sock
+
+    # Runs login and the respective tasks each crawler needs and makes a socket for each. 
+    def run(self):
+        self.login()
+        self.crawl_queue.put(ORIGIN_PATH)  # Start with the origin path
+
+        threads = [threading.Thread(target=self.runCrawlerTask) for _ in range(5)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()  # Wait for all threads to complete
+
+    # Handles the crawling process for each queued link until the queue is empty.
+    def runCrawlerTask(self):
+        while True:
+            try:
+                path = self.crawl_queue.get(timeout=5)  
+                self.explore_web_path(path)
+                self.crawl_queue.task_done()
+            except queue.Empty:
+                break
+
+    # explores a given web path by sending an HTTP GET request, retrieving and processing the data. It ensures paths are not revisited and stops the process after discovering 5 secret flags. Handles errors gracefully.
+    def explore_web_path(self, path):
+        if len(self.secret_flags_discovered) >= 5:
+            sys.exit(1)
+       
+        with self.url_lock:  # Acquire the URL lock
+            if path in self.visited_urls:
+                return
+            self.visited_urls.add(path)
+ 
+        try:
+            mysocket = self.create_socket()
+            self.fetchData(mysocket, path)
+            data = mysocket.recv(4096).decode('ascii')
+            self.processServerResponse(mysocket, data, path)
+            mysocket.close()
+        except Exception as e:
+            print(f"Error crawling {path}: {e}")
+
+
+    # Sends the HTTP login information with the username and password
+    def login(self, retry_count=3):
+        attempts = 0
+        while attempts < retry_count:
+            try:
+                mysocket = self.create_socket()
+                self.fetchData(mysocket, LOGIN_PATH)
+                # Receiving and decoding data to fetch CSRF token
+                data = mysocket.recv(4096).decode('ascii')
+
+                # Inline implementation of extracting CSRF middleware token
+                csrfmiddlewaretoken_match = re.search(r'name="csrfmiddlewaretoken" value="([^"]+)"', data)
+                csrfmiddlewaretoken = csrfmiddlewaretoken_match.group(1) if csrfmiddlewaretoken_match else None
+
+                while not csrfmiddlewaretoken:
+                    additional_data = mysocket.recv(4096).decode('ascii')
+                    if additional_data:
+                        data += additional_data
+                        csrfmiddlewaretoken_match = re.search(r'name="csrfmiddlewaretoken" value="([^"]+)"', data)
+                        csrfmiddlewaretoken = csrfmiddlewaretoken_match.group(1) if csrfmiddlewaretoken_match else None
+
+                # Extracting authentication cookies from the initial response
+                csrftoken_match = re.search(r'set-cookie:\s*csrftoken=([^;]+)', data)
+                sessionid_match = re.search(r'set-cookie:\s*sessionid=([^;]+)', data)
+                if csrftoken_match:
+                    self.csrftoken = csrftoken_match.group(1)
+                if sessionid_match:
+                    self.sessionid = sessionid_match.group(1)
+
+                # Prepare and send POST request for login
+                post_data = f"username={self.username}&password={self.password}&csrfmiddlewaretoken={csrfmiddlewaretoken}&next=/fakebook/"
+                self.transmitData(mysocket, LOGIN_PATH, post_data)
+
+                # Receiving the response after POST request
+                response = mysocket.recv(4096).decode('ascii')
+                response_code = response.splitlines()[0].split(' ')[1]
+
+                # Check response code
+                if response_code in ['200', '302']:
+                    # Extracting cookies again in case they are updated
+                    csrftoken_match = re.search(r'set-cookie:\s*csrftoken=([^;]+)', response)
+                    sessionid_match = re.search(r'set-cookie:\s*sessionid=([^;]+)', response)
+                    if csrftoken_match:
+                        self.csrftoken = csrftoken_match.group(1)
+                    if sessionid_match:
+                        self.sessionid = sessionid_match.group(1)
+                    mysocket.close()
+                    return True  # Login successful
+                else:
+                    attempts += 1
+                    time.sleep(1)  # Wait a bit before retrying
+            except Exception as e:
+                print(f"Error during login attempt: {e}")
+                attempts += 1
+                time.sleep(1)  # Wait a bit before retrying
+                if mysocket:
+                    mysocket.close()
+        print("Failed to login after several attempts.")
+        return False
+
+    # send an HTTP GET request to a specified path on a server using a socket connection
+    def fetchData(self, mysocket, path):
+        # Initialize request headers in a list for easier management
+        headers = [
+            f"GET {path} HTTP/1.1",
+            f"Host: {self.server}:{self.port}",
+            "Connection: keep-alive"
+        ]
+        
+        # Add the Cookie header if both csrftoken and sessionid are provided
+        if self.csrftoken and self.sessionid:
+            headers.append(f"Cookie: csrftoken={self.csrftoken}; sessionid={self.sessionid};")
+        
+        # Combine the headers and the final CRLF to complete the request
+        request = "\r\n".join(headers) + "\r\n\r\n"
+        
+        # Send the request over the socket
+        mysocket.sendall(request.encode('ascii'))
+
+    # Sends an HTTP POST request to a specific path on the server using a socket connection.
+    def transmitData(self, mysocket, path, postData):
+        # Headers are collected in a dictionary for ease of management.
+        headers = {
+            "Host": f"{self.server}:{self.port}",
+            "Content-Length": str(len(postData)),
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        
+        # If CSRF token and session ID are available, add them as a Cookie header.
+        if self.csrftoken and self.sessionid:
+            headers["Cookie"] = f"csrftoken={self.csrftoken}; sessionid={self.sessionid};"
+        
+        # Start assembling the request line and headers.
+        requestLines = [f"POST {path} HTTP/1.1"] + [f"{key}: {value}" for key, value in headers.items()]
+        
+        # Combine the request components and append the postData.
+        request = "\r\n".join(requestLines) + "\r\n\r\n" + postData
+        
+        # Send the assembled request through the socket.
+        mysocket.sendall(request.encode('ascii'))
+
+    # Switch statement for handling various response codes
+    def processServerResponse(self, mysocket, response, path):
+        # Attempt to extract the response code from the response.
+        try:
+            response_lines = response.splitlines()
+            status_line = response_lines[0]
+            response_code = status_line.split(' ')[1]
+        except IndexError:
+            print("Error: Invalid format in response.")
+            return
+
+        # Handle 200 OK responses.
+        if response_code == '200':
+            # Process the page content directly here.
+            parser = parseHTML(self)
+            parser.feed(response)
+
+        # Handle 302 Redirect responses.
+        elif response_code == '302':
+            # Extract location header for redirection.
+            for line in response_lines:
+                if line.lower().startswith('location:'):
+                    location = line.split(':', 1)[1].strip()
+                    if location not in self.visited_urls:
+                        self.crawl_queue.put(location)
+                    break
+
+        # Handle 4XX Client Error responses.
+        elif response_code.startswith('4'):
+            # Decide the next action based on the queue's state.
+            next_path = self.crawl_queue.get() if not self.crawl_queue.empty() else self.origin_path
+            self.explore_web_path(next_path)
+
+        # Handle 5XX Server Error responses.
+        elif response_code.startswith('5'):
+            # Retry after a delay.
+            time.sleep(1)
+            self.fetchData(mysocket, path)
+            try:
+                data_received = mysocket.recv(4096).decode('ascii')
+                self.processServerResponse(mysocket, data_received, path)
+            except Exception as e:
+                print(f"Error receiving data: {e}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='crawl Fakebook')
+    parser.add_argument('-s', dest="server", type=str, default=DEFAULT_SERVER, help="The server to crawl")
+    parser.add_argument('-p', dest="port", type=int, default=DEFAULT_PORT, help="The port to use")
+    parser.add_argument('username', type=str, help="The username to use")
+    parser.add_argument('password', type=str, help="The password to use")
+    args = parser.parse_args()
+    crawler = Crawler(args)
+    crawler.run()
